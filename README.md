@@ -6,9 +6,10 @@ This directory hosts a toolchain that couples the Gaussian `external` interface 
 ## Directory Layout
 | File | Description |
 | --- | --- |
-| `xtb.sh` | Core external script called by Gaussian, responsible for job orchestration and file management |
-| `genxyz` / `genxyz.f90` | Utility that converts Gaussian’s `mol.tmp` into the `mol.xyz` format required by xTB |
-| `extderi` / `extderi.f90` | Extracts energy, gradients, and Hessian data from xTB outputs and writes them back to Gaussian |
+| `gau_xtb/` | Toolbox directory that houses all runtime helpers required by Gaussian’s `external` interface |
+| `gau_xtb/xtbint` | Core external script called by Gaussian, responsible for job orchestration and file management |
+| `gau_xtb/genxyz` / `gau_xtb/genxyz.f90` | Utility that converts Gaussian’s `mol.tmp` into the `mol.xyz` format required by xTB |
+| `gau_xtb/extderi` / `gau_xtb/extderi.f90` | Extracts energy, gradients, and Hessian data from xTB outputs and writes them back to Gaussian |
 | `*.gjf` / `*.log` | Sample input and log files |
 
 > The executables and the Fortran sources for `genxyz` and `extderi` are both provided and can be recompiled on the target platform if necessary.
@@ -24,7 +25,7 @@ This directory hosts a toolchain that couples the Gaussian `external` interface 
 5. **Automatic cleanup**: Temporary directories and prefixed intermediates are removed by default to keep the workspace tidy.
 
 ## Workflow
-1. Gaussian invokes `xtb.sh` via the `external` keyword.
+1. Gaussian invokes `xtbint` via the `external` keyword.
 2. The script parses the temporary input file (`$2`) and extracts atom count, derivative order, charge, and spin multiplicity.
 3. A unique prefix is generated and a temporary working directory is created.
 4. `genxyz` produces `mol.xyz`; xTB is then executed with the proper `--grad` / `--hess` options according to the derivative level.
@@ -33,7 +34,7 @@ This directory hosts a toolchain that couples the Gaussian `external` interface 
 
 The following diagram summarizes the data flow:
 ```
-Gaussian (external) -> xtb.sh -> genxyz -> xTB -> extderi -> Gaussian
+Gaussian (external) -> xtbint -> genxyz -> xTB -> extderi -> Gaussian
 ```
 
 ## Prerequisites
@@ -43,27 +44,39 @@ Gaussian (external) -> xtb.sh -> genxyz -> xTB -> extderi -> Gaussian
 - **mktemp**: Creates temporary directories (the script falls back to `$$` and `$RANDOM` if unavailable).
 - **Fortran compiler (optional)**: Required only when recompiling `genxyz.f90` or `extderi.f90`.
 
+## Installation
+1. **Build or obtain the helpers**: Compile `gau_xtb/genxyz.f90` and `gau_xtb/extderi.f90` if your platform requires freshly built executables.
+2. **Pick a toolbox directory**: Place the `gau_xtb` folder (containing `xtbint`, `genxyz`, `extderi`) under a single location (e.g. `/opt/gau_xtb`).
+3. **Expose the folder to Gaussian jobs**:
+   - Option 1 — **Add to `PATH`**: Append `/opt/gau_xtb/gau_xtb` to your shell profile, e.g. `export PATH="/opt/gau_xtb/gau_xtb:$PATH"` (Linux) or `set -x PATH /opt/gau_xtb/gau_xtb $PATH` (csh/tcsh).
+   - Option 2 — **Pin with `GAUXTB_HOME`**: Set `export GAUXTB_HOME=/opt/gau_xtb/gau_xtb` in the submission environment; the wrapper uses this variable to locate `genxyz` and `extderi` even if `xtbint` is symlinked elsewhere.
+4. **Grant execute permission**: Ensure the three executables are marked executable (`chmod +x gau_xtb/xtbint gau_xtb/genxyz gau_xtb/extderi`).
+
+> With `gau_xtb` on `PATH` or `GAUXTB_HOME` defined, you no longer need to copy the wrapper files into every Gaussian working directory.
+
 ## Quick Start
-1. **Prepare the scripts**: Place `xtb.sh`, `genxyz`, and `extderi` in the same folder and grant execute permission.
-2. **Author the Gaussian input**: Add `external="./xtb.sh"` to the route section, e.g.
+1. **Author the Gaussian input**: Add `external="xtbint"` (or use an absolute/relative path like `external="/opt/gau_xtb/gau_xtb/xtbint"`) to the route section, e.g.
+   
    ```
    %chk=myjob.chk
    %mem=8GB
    %nprocshared=1
-   # opt=(nomicro) external='./xtb.sh'
-
+   
+   opt=(nomicro) external='xtbint'
+   
    My job title
-
+   
    0 1
    ... molecular structure ...
    ```
-3. **Submit the calculation**: Run Gaussian in the directory; the script handles the xTB calls automatically.
+2. **Submit the calculation**: Run Gaussian in the directory; the script handles the xTB calls automatically.
 4. **Inspect the results**: Gaussian logs contain energy and gradient data from xTB. Refer to the environment variables section if you need additional intermediate outputs.
 
 ## Environment Variables
 | Variable | Default | Description |
 | --- | --- | --- |
 | `GAUSS_JOBNAME` | Set by Gaussian | Automatically inferred by the script when absent |
+| `GAUXTB_HOME` | unset | When set, provides the directory containing `genxyz` and `extderi`; useful when `xtb` lives on `PATH` or behind a symlink |
 | `OMP_NUM_THREADS` / `MKL_NUM_THREADS` | 1 | Controls the thread count for xTB and linked BLAS/LAPACK libraries |
 | `XTB_KEEP_INTERMEDIATE` | 0 | Preserve prefixed files (e.g., `<prefix>_xtbout`, `<prefix>_mol.xyz`) when set to a non-zero value |
 

@@ -1,0 +1,142 @@
+#!/bin/bash
+
+#This script was written by Dr. Tian Lu at Beijing Kein Research Center for Natural Sciences (www.keinsci.com)
+#Contact: sobereva@sina.com
+
+resolve_script_dir(){
+    local target="$1"
+    while [ -L "$target" ]; do
+        local link_dir
+        link_dir=$(cd -P "$(dirname "$target")" && pwd)
+        target=$(readlink "$target")
+        [[ "$target" != /* ]] && target="$link_dir/$target"
+    done
+    cd -P "$(dirname "$target")" && pwd
+}
+
+if [[ -n "${GAUXTB_HOME:-}" ]]; then
+    SCRIPT_DIR="${GAUXTB_HOME%/}"
+else
+    SCRIPT_PATH="$0"
+    if [[ "$SCRIPT_PATH" != */* ]]; then
+        SCRIPT_PATH=$(command -v -- "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
+    fi
+    SCRIPT_DIR=$(resolve_script_dir "$SCRIPT_PATH")
+fi
+SCRIPT_DIR=${SCRIPT_DIR:-$(pwd)}
+ORIG_DIR=$(pwd)
+
+INPUT_FILE=$2
+OUTPUT_FILE=$3
+if [[ "$INPUT_FILE" != /* ]]; then
+	INPUT_FILE="$ORIG_DIR/$INPUT_FILE"
+fi
+if [[ "$OUTPUT_FILE" != /* ]]; then
+	OUTPUT_FILE="$ORIG_DIR/$OUTPUT_FILE"
+fi
+
+read atoms derivs charge spin < "$INPUT_FILE"
+
+PREFIX="${GAUSS_JOBNAME:-}"
+if [[ -z "$PREFIX" ]]; then
+	BASE_NAME=$(basename "$OUTPUT_FILE")
+	PREFIX="${BASE_NAME%.*}"
+fi
+if [[ -z "$PREFIX" ]]; then
+	BASE_NAME=$(basename "$INPUT_FILE")
+	PREFIX="${BASE_NAME%.*}"
+fi
+if [[ -z "$PREFIX" ]]; then
+	PREFIX="xtb_job"
+fi
+PREFIX=${PREFIX//[^A-Za-z0-9_.-]/_}
+echo "Using prefix: $PREFIX"
+
+if command -v mktemp >/dev/null 2>&1; then
+	WORKDIR=$(mktemp -d -p "$ORIG_DIR" "${PREFIX}_xtb_XXXXXX")
+else
+	WORKDIR="$ORIG_DIR/${PREFIX}_xtb_$$.$RANDOM"
+	mkdir -p "$WORKDIR"
+fi
+
+cleanup(){
+	rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+cd "$WORKDIR"
+
+#Create temporary .xyz file
+#the element index should be replaced with element name, and the coordinate should be convert to Angstrom
+echo "Generating ${PREFIX}_mol.tmp"
+cat > mol.tmp <<EOF
+$atoms
+
+$(sed -n "2,$(($atoms+1))p" "$INPUT_FILE" | cut -c 1-72)
+EOF
+
+echo "Generating ${PREFIX}_mol.xyz via genxyz"
+"$SCRIPT_DIR/genxyz"
+rm -f mol.tmp
+
+rm -f charges energy xtbrestart gradient hessian xtbout
+rm -f hessian xtb_normalmodes g98_canmode.out g98.out wbo xtbhess.coord
+
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-8}
+uhf=$(echo "$spin-1" | bc) #nalpha-nbeta
+if [ "$derivs" = "2" ] ; then
+	echo "Running: xtb mol.xyz --chrg $charge --uhf $uhf --hess --grad --gfn 2 > xtbout"
+	xtb mol.xyz --chrg $charge --uhf $uhf --hess --grad --gfn 2 > xtbout
+elif [ "$derivs" = "1" ] ; then
+	echo "Running: xtb mol.xyz --chrg $charge --uhf $uhf --grad --gfn 2 > xtbout"
+	xtb mol.xyz --chrg $charge --uhf $uhf --grad --gfn 2 > xtbout
+elif [ "$derivs" = "0" ] ; then
+	echo "Running: xtb mol.xyz --chrg $charge --uhf $uhf --gfn 2 > xtbout"
+	xtb mol.xyz --chrg $charge --uhf $uhf --gfn 2 > xtbout
+fi
+echo "xtb running finished!"
+
+if grep -qi "normal termination" xtbout 2>/dev/null; then
+	echo "XTB normal termination!"
+else
+	echo "Warning: XTB may not have terminated normally, check ${PREFIX}_xtbout"
+fi
+
+echo "Extracting data from xtb outputs via extderi"
+"$SCRIPT_DIR/extderi" "$OUTPUT_FILE" "$atoms" "$derivs"
+
+declare -A XTB_FILES=(
+	["mol.xyz"]="${PREFIX}_mol.xyz"
+	["xtbout"]="${PREFIX}_xtbout"
+	["gradient"]="${PREFIX}_gradient"
+	["hessian"]="${PREFIX}_hessian"
+	["charges"]="${PREFIX}_charges"
+	["energy"]="${PREFIX}_energy"
+	["xtbrestart"]="${PREFIX}_xtbrestart"
+	["wbo"]="${PREFIX}_wbo"
+	["xtbtopo.mol"]="${PREFIX}_xtbtopo.mol"
+	["xtbhess.xyz"]="${PREFIX}_xtbhess.xyz"
+	["g98.out"]="${PREFIX}_g98.out"
+	["g98_canmode.out"]="${PREFIX}_g98_canmode.out"
+	["xtb_normalmodes"]="${PREFIX}_xtb_normalmodes"
+	["vibspectrum"]="${PREFIX}_vibspectrum"
+)
+
+if [ "${XTB_KEEP_INTERMEDIATE:-0}" != "0" ]; then
+	echo "Preserving XTB intermediate files with prefix ${PREFIX}_*"
+	for src in "${!XTB_FILES[@]}"; do
+		if [ -f "$src" ]; then
+			cp "$src" "$ORIG_DIR/${XTB_FILES[$src]}"
+		fi
+	done
+else
+	for dest in "${XTB_FILES[@]}"; do
+		rm -f "$ORIG_DIR/$dest"
+	done
+fi
+
+rm -f charges energy xtbrestart gradient hessian xtbout mol.xyz tmpxx vibspectrum
+rm -f hessian xtb_normalmodes g98_canmode.out g98.out wbo xtbhess.coord .tmpxtbmodef
+rm -f .engrad *.engrad xtbtopo.mol xtbhess.xyz
+
