@@ -1,7 +1,5 @@
 #!/bin/bash
 
-#This script was written by Dr. Tian Lu at Beijing Kein Research Center for Natural Sciences (www.keinsci.com)
-#Contact: sobereva@sina.com
 
 resolve_script_dir(){
     local target="$1"
