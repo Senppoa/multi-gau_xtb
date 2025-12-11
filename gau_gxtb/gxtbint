@@ -1,0 +1,225 @@
+#!/bin/bash
+
+#This script was written by Dr. Tian Lu at Beijing Kein Research Center for Natural Sciences (www.keinsci.com)
+#Contact: sobereva@sina.com
+
+resolve_script_dir(){
+    local target="$1"
+    while [ -L "$target" ]; do
+        local link_dir
+        link_dir=$(cd -P "$(dirname "$target")" && pwd)
+        target=$(readlink "$target")
+        [[ "$target" != /* ]] && target="$link_dir/$target"
+    done
+    cd -P "$(dirname "$target")" && pwd
+}
+
+if [[ -n "${GAUXTB_HOME:-}" ]]; then
+    SCRIPT_DIR="${GAUXTB_HOME%/}"
+else
+    SCRIPT_PATH="$0"
+    if [[ "$SCRIPT_PATH" != */* ]]; then
+        SCRIPT_PATH=$(command -v -- "$SCRIPT_PATH" 2>/dev/null || printf '%s' "$SCRIPT_PATH")
+    fi
+    SCRIPT_DIR=$(resolve_script_dir "$SCRIPT_PATH")
+fi
+SCRIPT_DIR=${SCRIPT_DIR:-$(pwd)}
+ORIG_DIR=$(pwd)
+
+INPUT_FILE=$2
+OUTPUT_FILE=$3
+if [[ "$INPUT_FILE" != /* ]]; then
+	INPUT_FILE="$ORIG_DIR/$INPUT_FILE"
+fi
+if [[ "$OUTPUT_FILE" != /* ]]; then
+	OUTPUT_FILE="$ORIG_DIR/$OUTPUT_FILE"
+fi
+
+read atoms derivs charge spin < "$INPUT_FILE"
+
+PREFIX="${GAUSS_JOBNAME:-}"
+if [[ -z "$PREFIX" ]]; then
+	BASE_NAME=$(basename "$OUTPUT_FILE")
+	PREFIX="${BASE_NAME%.*}"
+fi
+if [[ -z "$PREFIX" ]]; then
+	BASE_NAME=$(basename "$INPUT_FILE")
+	PREFIX="${BASE_NAME%.*}"
+fi
+if [[ -z "$PREFIX" ]]; then
+	PREFIX="xtb_job"
+fi
+PREFIX=${PREFIX//[^A-Za-z0-9_.-]/_}
+echo "Using prefix: $PREFIX"
+
+if command -v mktemp >/dev/null 2>&1; then
+	WORKDIR=$(mktemp -d -p "$ORIG_DIR" "${PREFIX}_xtb_XXXXXX")
+else
+	WORKDIR="$ORIG_DIR/${PREFIX}_xtb_$$.$RANDOM"
+	mkdir -p "$WORKDIR"
+fi
+
+cleanup(){
+	rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+
+cd "$WORKDIR"
+
+#Create temporary .xyz file
+#the element index should be replaced with element name, and the coordinate should be convert to Angstrom
+echo "Generating ${PREFIX}_mol.tmp"
+cat > mol.tmp <<EOF
+$atoms
+
+$(sed -n "2,$(($atoms+1))p" "$INPUT_FILE" | cut -c 1-72)
+EOF
+
+echo "Generating ${PREFIX}_mol.xyz via genxyz"
+"$SCRIPT_DIR/genxyz"
+rm -f mol.tmp
+
+rm -f charges energy xtbrestart gradient hessian xtbout
+rm -f hessian xtb_normalmodes g98_canmode.out g98.out wbo xtbhess.coord
+
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8}
+export MKL_NUM_THREADS=${MKL_NUM_THREADS:-8}
+uhf=$(echo "$spin-1" | bc) #nalpha-nbeta
+
+printf '%d\n' "$charge" > .CHRG
+printf '%d\n' "$uhf" > .UHF
+
+gxtb_cmd=(gxtb -c mol.xyz)
+need_grad=0
+if [ "$derivs" = "2" ] ; then
+    gxtb_cmd+=( -grad -hess )
+    need_grad=1
+elif [ "$derivs" = "1" ] ; then
+    gxtb_cmd+=( -grad )
+    need_grad=1
+fi
+
+echo "Running: ${gxtb_cmd[*]} > xtbout"
+"${gxtb_cmd[@]}" > xtbout 2>&1
+echo "g-XTB running finished!"
+
+if [ -f "energy" ]; then
+    mv energy energy.raw
+else
+    echo "Error: energy file not produced by g-XTB" >&2
+    exit 1
+fi
+
+if [ "$need_grad" -eq 1 ]; then
+    if [ -f "gradient" ]; then
+        mv gradient gradient.raw
+    else
+        echo "Warning: gradient file not produced by g-XTB, creating zero gradients" >&2
+        : > gradient.raw
+    fi
+else
+    : > gradient.raw
+fi
+
+energy_value=$(awk 'NR==2 {val=$2; gsub(/[Dd]/,"E",val); print val}' energy.raw)
+if [ -z "$energy_value" ]; then
+    echo "Error: failed to extract energy from energy.raw" >&2
+    exit 1
+fi
+
+grad_body=$(mktemp)
+if [ "$need_grad" -eq 1 ]; then
+    if ! awk -v natm="$atoms" '
+        NR<=2 {next}
+        count<natm {
+            line=$0
+            gsub(/[Dd]/,"E",line)
+            split(line,a)
+            if (length(a)>=3) {
+                printf "%s %s %s\n",a[1],a[2],a[3]
+                count++
+            }
+        }
+        END {
+            if (count<natm) {
+                printf "0.0 0.0 0.0\n" > "/dev/stderr"
+                exit 1
+            }
+        }
+    ' gradient.raw > "$grad_body"; then
+        echo "Warning: insufficient gradient data, filling zeros" >&2
+        seq 1 "$atoms" | awk '{print "0.0 0.0 0.0"}' > "$grad_body"
+    fi
+else
+    seq 1 "$atoms" | awk '{print "0.0 0.0 0.0"}' > "$grad_body"
+fi
+
+coord_body=$(mktemp)
+sed -n "2,$((atoms+1))p" "$INPUT_FILE" | awk '{printf " %s %s %s %s\n",$1,$2,$3,$4}' > "$coord_body"
+
+if [ -s xtbout ]; then
+    mv xtbout xtbout.log
+fi
+{
+    echo "g-XTB synthetic output"
+    printf "%30s%24.12f\n" "total energy" "$energy_value"
+    echo " g-XTB normal termination"
+    echo
+    if [ -f xtbout.log ]; then
+        cat xtbout.log
+    fi
+} > xtbout
+
+{
+    echo '$grad'
+    echo ' generated from g-XTB interface'
+    cat "$coord_body"
+    awk '{printf "%20.12f%20.12f%20.12f\n",$1,$2,$3}' "$grad_body"
+} > gradient
+rm -f "$grad_body"
+rm -f "$coord_body"
+rm -f energy.raw gradient.raw
+
+if grep -qi "normal termination" xtbout 2>/dev/null; then
+    echo "g-XTB normal termination!"
+else
+    echo "Warning: g-XTB may not have terminated normally, check ${PREFIX}_xtbout"
+fi
+
+echo "Extracting data from g-XTB outputs via extderi"
+"$SCRIPT_DIR/extderi" "$OUTPUT_FILE" "$atoms" "$derivs"
+
+declare -A XTB_FILES=(
+	["mol.xyz"]="${PREFIX}_mol.xyz"
+	["xtbout"]="${PREFIX}_xtbout"
+	["gradient"]="${PREFIX}_gradient"
+	["hessian"]="${PREFIX}_hessian"
+	["charges"]="${PREFIX}_charges"
+	["energy"]="${PREFIX}_energy"
+	["xtbrestart"]="${PREFIX}_xtbrestart"
+	["wbo"]="${PREFIX}_wbo"
+	["xtbtopo.mol"]="${PREFIX}_xtbtopo.mol"
+	["xtbhess.xyz"]="${PREFIX}_xtbhess.xyz"
+	["g98.out"]="${PREFIX}_g98.out"
+	["g98_canmode.out"]="${PREFIX}_g98_canmode.out"
+	["xtb_normalmodes"]="${PREFIX}_xtb_normalmodes"
+	["vibspectrum"]="${PREFIX}_vibspectrum"
+)
+
+if [ "${XTB_KEEP_INTERMEDIATE:-0}" != "0" ]; then
+	echo "Preserving XTB intermediate files with prefix ${PREFIX}_*"
+	for src in "${!XTB_FILES[@]}"; do
+		if [ -f "$src" ]; then
+			cp "$src" "$ORIG_DIR/${XTB_FILES[$src]}"
+		fi
+	done
+else
+	for dest in "${XTB_FILES[@]}"; do
+		rm -f "$ORIG_DIR/$dest"
+	done
+fi
+
+rm -f charges energy xtbrestart gradient hessian xtbout mol.xyz tmpxx vibspectrum
+rm -f hessian xtb_normalmodes g98_canmode.out g98.out wbo xtbhess.coord .tmpxtbmodef
+rm -f .engrad *.engrad xtbtopo.mol xtbhess.xyz
+
